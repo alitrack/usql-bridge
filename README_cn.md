@@ -53,18 +53,15 @@ LOAD 'luajit.duckdb_extension';
 SELECT * FROM luajit_module(mode := 'quick_compile', sql_name := 'usql',
   source := 'return dofile(''usql.lua'')');
 
--- 连接（冷启在这里：桥内部立刻 Ping）
-SELECT luajit_s('usql', {op: 'connect', url: 'moderncsqlite:///tmp/app.db'});
-
--- 查询：每行一个 JSON 对象
-SELECT luajit_s('usql', {op: 'query', id: 1, sql: 'SELECT id, name FROM src ORDER BY id'});
-
--- 写
-SELECT luajit_s('usql', {op: 'exec', id: 1, sql: 'INSERT INTO src VALUES (9, ''zeta'')'});
-
--- 关闭
-SELECT luajit_s('usql', {op: 'close', id: 1});
+-- 本库是表函数：桥返回的每个 JSON 对象 = 一行
+SELECT val FROM luajit_table('usql', list := '{"op":"connect","url":"moderncsqlite:////tmp/app.db"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"query","id":1,"sql":"SELECT id, name FROM src ORDER BY id"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"exec","id":1,"sql":"INSERT INTO src VALUES (9, ''zeta'')"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"benchmark","id":1,"n":200,"sql":"SELECT 1"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"close","id":1}');
 ```
+
+（`quick_compile` 同时生成便捷宏，可直接 `SELECT * FROM usql('{"op":"connect",...}')`。）
 
 连接 id 在同一个 DuckDB 进程内跨调用持久（Go 侧 `map[int]*sql.DB`）；
 出错返回单行 `ERR: <原因>`。

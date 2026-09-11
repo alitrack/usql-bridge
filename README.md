@@ -57,20 +57,16 @@ LOAD 'luajit.duckdb_extension';
 SELECT * FROM luajit_module(mode := 'quick_compile', sql_name := 'usql',
   source := 'return dofile(''usql.lua'')');
 
--- connect (cold start happens here: the bridge Pings immediately)
-SELECT luajit_s('usql', {op: 'connect', url: 'moderncsqlite:///tmp/app.db'});
-
--- query: one JSON object per row
-SELECT luajit_s('usql', {op: 'query', id: 1, sql: 'SELECT id, name FROM src ORDER BY id'});
-
--- write
-SELECT luajit_s('usql', {op: 'exec', id: 1, sql: 'INSERT INTO src VALUES (9, ''zeta'')'});
-
--- sustained-query benchmark
-SELECT luajit_s('usql', {op: 'benchmark', id: 1, n: 200, sql: 'SELECT 1'});
-
-SELECT luajit_s('usql', {op: 'close', id: 1});
+-- the lib is a table function: one row per JSON object returned by the bridge
+SELECT val FROM luajit_table('usql', list := '{"op":"connect","url":"moderncsqlite:////tmp/app.db"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"query","id":1,"sql":"SELECT id, name FROM src ORDER BY id"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"exec","id":1,"sql":"INSERT INTO src VALUES (9, ''zeta'')"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"benchmark","id":1,"n":200,"sql":"SELECT 1"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"close","id":1}');
 ```
+
+(A convenience macro is also generated, e.g. `SELECT * FROM usql('{"op":"connect",...}')`
+after `quick_compile`.)
 
 Connection ids stay valid for the lifetime of the DuckDB process (Go side keeps
 `map[int]*sql.DB`). Errors come back as a single `ERR: <reason>` row.
