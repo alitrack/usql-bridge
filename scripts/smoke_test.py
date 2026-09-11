@@ -3,8 +3,9 @@
 
 Loads the artifact with ctypes (the same C ABI LuaJIT FFI uses), opens a
 throwaway SQLite database through the embedded xo/usql driver, and checks a
-write/read round trip. Runs identically on Linux, macOS and Windows, so CI can
-prove that each platform artifact actually loads and queries.
+write/read round trip plus a native Parquet export. Runs identically on Linux,
+macOS and Windows, so CI can prove that each platform artifact actually loads,
+queries, and writes a real Parquet file.
 
     python3 scripts/smoke_test.py dist/usqlbridge-linux-amd64.so
 """
@@ -34,6 +35,8 @@ def main() -> int:
     lib.usql_query.argtypes = [ctypes.c_int, ctypes.c_char_p]
     lib.usql_exec.restype = ctypes.c_char_p
     lib.usql_exec.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    lib.usql_export.restype = ctypes.c_char_p
+    lib.usql_export.argtypes = [ctypes.c_char_p]
     lib.usql_close.restype = ctypes.c_int
     lib.usql_close.argtypes = [ctypes.c_int]
 
@@ -74,6 +77,37 @@ def main() -> int:
         if agg != [{"n": 2, "s": 3}]:
             print(f"FAIL: unexpected aggregate {agg}", file=sys.stderr)
             return 1
+
+        # native columnar export (v0.2.0): no JSON, declared types -> Parquet
+        pq = os.path.join(tmpdir, "out.parquet").replace("\\", "/")
+        spec = json.dumps({
+            "op": "export",
+            "id": cid,
+            "sql": "SELECT a, b FROM t ORDER BY a",
+            "format": "parquet",
+            "path": pq,
+        })
+        out = lib.usql_export(spec.encode())
+        print("export:", out)
+        if out.startswith(b"ERR:"):
+            print(f"FAIL: export returned {out!r}", file=sys.stderr)
+            return 1
+        if os.path.abspath(out.decode()) != os.path.abspath(pq):
+            print(f"FAIL: export returned {out!r}, expected {pq!r}", file=sys.stderr)
+            return 1
+        pq_size = os.path.getsize(pq)
+        with open(pq, "rb") as fh:
+            head = fh.read(4)
+            fh.seek(-4, os.SEEK_END)
+            tail = fh.read(4)
+        if head != b"PAR1" or tail != b"PAR1" or pq_size < 100:
+            print(
+                f"FAIL: not a parquet file (head={head!r} tail={tail!r} size={pq_size})",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"parquet ok: {pq_size} bytes")
+
         if lib.usql_close(cid) != 1:
             print("FAIL: close did not report success", file=sys.stderr)
             return 1

@@ -42,10 +42,12 @@ an in-process connection is worth having.
 | File | Purpose |
 |---|---|
 | `main.go` | the bridge: `//export usql_connect / usql_query / usql_exec / usql_close` |
-| `usql.lua` | LuaJIT FFI wrapper — `ffi.cdef` + `ffi.load`, returns JSON strings |
+| `export.go` | native columnar export: `//export usql_export` — declared types → Parquet, no JSON |
+| `usql.lua` | LuaJIT FFI wrapper — `ffi.cdef` + `ffi.load`, returns JSON strings / file paths |
 | `build-release.sh` | builds c-shared artifacts per target (`linux-amd64`, `linux-arm64`, `darwin-arm64`, `darwin-amd64`, `windows-amd64`) |
 | `scripts/smoke_test.py` | loads a built artifact with ctypes and runs a SQL round trip — the per-platform CI gate |
 | `test_usql_bridge.sql` | full chain through DuckDB → luajit → bridge → SQLite, plus a 200-query benchmark |
+| `test_export.sql` | native Parquet export end to end: types, bytes, no `from_json` on the DuckDB side |
 | `.github/workflows/` | `ci.yml` (build + smoke test on every push) and `release.yml` (tag → all-platform release) |
 | `usqlbridge.h` | generated cgo header, kept in-tree for reference |
 
@@ -61,6 +63,7 @@ SELECT * FROM luajit_module(mode := 'quick_compile', sql_name := 'usql',
 SELECT val FROM luajit_table('usql', list := '{"op":"connect","url":"moderncsqlite:////tmp/app.db"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"query","id":1,"sql":"SELECT id, name FROM src ORDER BY id"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"exec","id":1,"sql":"INSERT INTO src VALUES (9, ''zeta'')"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"export","id":1,"sql":"SELECT * FROM src","format":"parquet"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"benchmark","id":1,"n":200,"sql":"SELECT 1"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"close","id":1}');
 ```
@@ -70,6 +73,40 @@ after `quick_compile`.)
 
 Connection ids stay valid for the lifetime of the DuckDB process (Go side keeps
 `map[int]*sql.DB`). Errors come back as a single `ERR: <reason>` row.
+
+## Columnar export — `export` (v0.2.0)
+
+The JSON ops are a *display* channel: JSON has only number/string/bool/null, so
+DuckDB has to infer types back (DATE and DATETIME arrive as VARCHAR, BOOLEAN as
+an integer, DECIMAL as DOUBLE) and text conversion turns non-UTF-8 bytes
+(BLOBs) into U+FFFD irreversibly. `export` skips all of that: the bridge builds
+a Parquet schema from the driver's **declared column types**, writes the values
+as they come, and returns the file path.
+
+```sql
+-- table-function form
+SELECT val FROM luajit_table('usql', list :=
+  '{"op":"export","id":1,"sql":"SELECT * FROM src","path":"/tmp/src.parquet","format":"parquet"}');
+
+-- scalar form: feed read_parquet directly
+SELECT * FROM read_parquet(usql('{"op":"export","id":1,"sql":"SELECT * FROM src"}'));
+```
+
+* `path` — omitted ⇒ written to the system temp dir as
+  `usql-export-<pid>-<nanos>.parquet` and **deleted when the connection is
+  closed**. Give an explicit `path` and the file is yours to manage.
+* `compression` — `snappy` (default) or `none`/`uncompressed`.
+* `row_group_rows` — optional row-group size.
+* Declared types are mapped straight through: INTEGER/BIGINT → `BIGINT`,
+  REAL/DOUBLE → `DOUBLE`, TEXT/VARCHAR → `VARCHAR`, BLOB/BYTEA → `BLOB`,
+  BOOLEAN → `BOOLEAN`, DATE → `DATE`, DATETIME/TIMESTAMP → `TIMESTAMP`
+  (with/without time zone per the declared type). Unknown or all-NULL columns
+  fall back to `VARCHAR` — the bridge never guesses a numeric type for an
+  untyped column, because a wrong guess is silent wrong data.
+* Known limit: `DECIMAL/NUMERIC` currently map to `DOUBLE` (precision beyond
+  float64's ~15 digits is not preserved). Money-grade decimals need the
+  `decimal(scale,precision)` path, which is not wired up yet.
+* Cost: the binary grows from 10.7 MB to 20.8 MB (parquet-go + snappy codec).
 
 ## Drivers (schemes)
 
@@ -110,7 +147,7 @@ machine cross-compiling everything.
 
 `usql.lua` resolves the library as: `spec.lib` → `USQL_BRIDGE_LIB` →
 `~/.duckdb/luajit-libs/usqlbridge-<os>-<arch>.<ext>` → one download attempt from
-the v0.1.1 release. A download is accepted only if it clears a size floor **and**
+the v0.2.0 release. A download is accepted only if it clears a size floor **and**
 carries the platform's magic bytes (ELF / PE / Mach-O): the release CDN does
 truncate silently (measured: 7.6 MB of an 11.2 MB artifact after 6m25s, then
 0 bytes on retry, while `raw.githubusercontent.com` answered in 1s).
@@ -119,14 +156,14 @@ Where the release CDN is slow or blocked, point the download at any mirror
 prefix (trailing slash required) and let the library fetch it:
 
 ```bash
-export USQL_BRIDGE_BASE_URL='https://gh-proxy.com/https://github.com/alitrack/usql-bridge/releases/download/v0.1.1/'
+export USQL_BRIDGE_BASE_URL='https://gh-proxy.com/https://github.com/alitrack/usql-bridge/releases/download/v0.2.0/'
 ```
 
 Or fetch it yourself and check the published checksums:
 
 ```bash
-gh release download v0.1.1 --repo alitrack/usql-bridge
-sha256sum -c SHA256SUMS            # 11.2 MB artifact verified this way
+gh release download v0.2.0 --repo alitrack/usql-bridge
+sha256sum -c SHA256SUMS            # 20.8 MB artifact verified this way
 cp usqlbridge-linux-amd64.so ~/.duckdb/luajit-libs/
 ```
 
@@ -141,6 +178,10 @@ Environment: go1.26.1, DuckDB 1.5.5, luajit ELF extension, SQLite via
 | CREATE / INSERT / SELECT / aggregate / write-read-back / close | all correct |
 | single query (incl. FFI hop + JSON encoding) | 0.1–0.3 ms |
 | 200 sustained queries | ~0.2 ms each, no cold start, no degradation |
+| 100k rows × 10 declared types — `op=query` (JSON) | 0.70–0.76 s, 19.2 MB of JSON text over FFI |
+| 100k rows × 10 declared types — `op=export` (Parquet) | **0.38–0.40 s**, 2.35 MB file (6.8 MB uncompressed) |
+| reading that file with `read_parquet` + `count/sum` | 0.002 s |
+| fidelity vs. the JSON path | `DATE`=2026-09-11, `TIMESTAMP` local, `BOOLEAN`, `BIGINT` 9007199254740993 exact, `BLOB` `00FF000A0D010203` byte-exact, 100000/100000 rows keep the `\|` character |
 
 ## Pitfalls hit while building this
 
@@ -163,12 +204,20 @@ Environment: go1.26.1, DuckDB 1.5.5, luajit ELF extension, SQLite via
    the library prints an actionable error telling you where to drop the file.
 8. **`/mnt/d` is a slow 9p mount** — keep `GOMODCACHE`/`GOPATH` on the native
    filesystem.
+9. **parquet-go's `date` node expects int32 epoch days**, not a `time.Time`
+   whose Unix *seconds* get written verbatim — a DATE column came back as
+   `5461899-03-14 (BC)` until the bridge converted to days itself.
+10. **`luajit_table` hands the module a string, `luajit_vs` hands it a table**
+    (one table per argument, chunk-batched, expecting a table back). The same
+    library file must accept both shapes; assuming a string made every
+    `usql('<spec>')` macro call die with `attempt to call method 'match'`.
 
 ## Status
 
-v0.1.1 — all five platform artifacts built and smoke-tested in CI. Only the
-SQLite (`moderncsqlite`) driver has been exercised end-to-end so far; the other
-schemes are one import away but not yet verified against live servers.
+v0.2.0 — native Parquet export (`op=export`) plus the v0.1.1 baseline: all five
+platform artifacts built and smoke-tested in CI. Only the SQLite
+(`moderncsqlite`) driver has been exercised end-to-end so far; the other schemes
+are one import away but not yet verified against live servers.
 
 ## License
 

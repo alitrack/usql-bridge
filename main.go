@@ -113,6 +113,7 @@ func usql_close(id C.int) C.int {
 	}
 	db.Close()
 	delete(conns, int(id))
+	cleanupExports(int(id))
 	return C.int(1)
 }
 

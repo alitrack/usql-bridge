@@ -4,6 +4,34 @@ LuaJIT FFI table function: one connect, then no per-query process cold start
 (measured ~0.1-0.2 ms/query sustained, vs 30-100 ms for spawning the `usql`
 CLI binary for every query).
 
+## What's new in v0.2.0
+
+**Native columnar export** — `{"op":"export", ...}` writes the result set as
+Parquet straight from the driver's *declared* column types and returns the file
+path, so DuckDB reads it with `read_parquet` and never parses JSON:
+
+```sql
+SELECT * FROM read_parquet(usql('{"op":"export","id":1,"sql":"SELECT * FROM src"}'));
+```
+
+* Types survive: `DATE` stays `DATE`, `DATETIME` stays `TIMESTAMP`, `BOOLEAN`
+  stays `BOOLEAN`, `BIGINT` keeps 9007199254740993 exactly, `BLOB` keeps its
+  bytes (`00FF000A0D010203`, where the JSON path irreversibly produced U+FFFD).
+* Measured on 100k rows × 10 declared types: **0.38-0.40 s** and a 2.35 MB file,
+  versus 0.70-0.76 s and 19.2 MB of JSON text for the same data through
+  `op=query`. Reading the file back plus `count`/`sum` takes 0.002 s.
+* `path` is optional: omitted ⇒ system temp dir, deleted when the connection
+  closes. `compression` = `snappy` (default) or `none`.
+* Cost, stated plainly: the artifact grows from **10.7 MB to 20.8 MB**
+  (parquet-go + snappy codec).
+* Known limit: `DECIMAL/NUMERIC` currently map to `DOUBLE`; strict decimal
+  precision is not wired up yet.
+
+Also in this release: the LuaJIT library now accepts both entry shapes
+(`luajit_table` passes a string, `luajit_vs`/the `usql(...)` macro passes a
+chunk table), and the per-platform smoke test asserts a real Parquet file
+(`PAR1` header/footer) on every OS.
+
 ## Artifacts
 
 | Platform | File |
@@ -38,6 +66,7 @@ SELECT * FROM luajit_module(mode := 'quick_compile', sql_name := 'usql',
 SELECT val FROM luajit_table('usql', list := '{"op":"connect","url":"moderncsqlite:////tmp/app.db"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"query","id":1,"sql":"SELECT 1 AS a"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"exec","id":1,"sql":"CREATE TABLE t(a INT)"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"export","id":1,"sql":"SELECT * FROM t","format":"parquet"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"close","id":1}');
 ```
 

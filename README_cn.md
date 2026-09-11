@@ -39,10 +39,12 @@ English version: [README.md](README.md)
 | 文件 | 作用 |
 |---|---|
 | `main.go` | 桥本体：`//export usql_connect / usql_query / usql_exec / usql_close` |
-| `usql.lua` | LuaJIT FFI 封装（`ffi.cdef` + `ffi.load`），结果以 JSON 串返回 |
+| `export.go` | 列式导出：`//export usql_export`——按声明类型直出 Parquet，不过 JSON |
+| `usql.lua` | LuaJIT FFI 封装（`ffi.cdef` + `ffi.load`），结果以 JSON 串 / 文件路径返回 |
 | `build-release.sh` | 按目标平台编 c-shared 工件 |
 | `scripts/smoke_test.py` | 用 ctypes 加载工件跑一轮 SQL 往返——每个平台的 CI 门 |
 | `test_usql_bridge.sql` | 全链路：DuckDB → luajit → 桥 → SQLite，含 200 次查询基准 |
+| `test_export.sql` | 原生 Parquet 导出端到端（类型、字节、DuckDB 侧不再 `from_json`） |
 | `.github/workflows/` | `ci.yml`（每次 push 编译+冒烟）、`release.yml`（打 tag 出全平台 release） |
 
 ## 用法
@@ -57,6 +59,7 @@ SELECT * FROM luajit_module(mode := 'quick_compile', sql_name := 'usql',
 SELECT val FROM luajit_table('usql', list := '{"op":"connect","url":"moderncsqlite:////tmp/app.db"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"query","id":1,"sql":"SELECT id, name FROM src ORDER BY id"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"exec","id":1,"sql":"INSERT INTO src VALUES (9, ''zeta'')"}');
+SELECT val FROM luajit_table('usql', list := '{"op":"export","id":1,"sql":"SELECT * FROM src","format":"parquet"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"benchmark","id":1,"n":200,"sql":"SELECT 1"}');
 SELECT val FROM luajit_table('usql', list := '{"op":"close","id":1}');
 ```
@@ -65,6 +68,34 @@ SELECT val FROM luajit_table('usql', list := '{"op":"close","id":1}');
 
 连接 id 在同一个 DuckDB 进程内跨调用持久（Go 侧 `map[int]*sql.DB`）；
 出错返回单行 `ERR: <原因>`。
+
+## 列式导出——`export`（v0.2.0）
+
+JSON 那几个 op 是**显示通道**：JSON 只有 number/string/bool/null，DuckDB 得把类型推断回来
+（DATE/DATETIME 变 VARCHAR、BOOLEAN 变整数、DECIMAL 变 DOUBLE），文本化还会把非 UTF-8
+字节（BLOB）不可逆地变成 U+FFFD。`export` 绕开这一整套：桥按 driver **声明的列类型**
+建 Parquet schema，值原样写盘，返回文件路径。
+
+```sql
+-- 表函数形态
+SELECT val FROM luajit_table('usql', list :=
+  '{"op":"export","id":1,"sql":"SELECT * FROM src","path":"/tmp/src.parquet","format":"parquet"}');
+
+-- 标量形态：直接喂 read_parquet
+SELECT * FROM read_parquet(usql('{"op":"export","id":1,"sql":"SELECT * FROM src"}'));
+```
+
+* `path`——不写就落系统临时目录 `usql-export-<pid>-<纳秒>.parquet`，并在**连接 close 时删掉**；
+  显式写了 path，文件就归你管，桥不碰。
+* `compression`——`snappy`（默认）或 `none`/`uncompressed`。
+* `row_group_rows`——可选的行组大小。
+* 声明类型直通：INTEGER/BIGINT → `BIGINT`，REAL/DOUBLE → `DOUBLE`，TEXT/VARCHAR → `VARCHAR`，
+  BLOB/BYTEA → `BLOB`，BOOLEAN → `BOOLEAN`，DATE → `DATE`，DATETIME/TIMESTAMP → `TIMESTAMP`
+  （带不带时区看声明）。未知类型和全 NULL 列兜底成 `VARCHAR`——桥不给「没有类型的列」
+  猜数值类型，猜错就是静默错数据。
+* 已知边界：`DECIMAL/NUMERIC` 目前映射成 `DOUBLE`（超过 float64 约 15 位有效数字的部分
+  不保精度）；要严格金额精度得走 `decimal(scale,precision)`，暂未接。
+* 代价：二进制从 10.7MB 涨到 20.8MB（parquet-go + snappy 编解码）。
 
 ## 驱动（scheme）
 
@@ -99,7 +130,7 @@ Apple SDK，Linux 上不存在可用的 darwin 交叉工具链——所以 relea
 ## 取工件与校验
 
 `usql.lua` 的解析顺序：`spec.lib` → `USQL_BRIDGE_LIB` →
-`~/.duckdb/luajit-libs/usqlbridge-<os>-<arch>.<ext>` → 从 v0.1.1 release 拉一次。
+`~/.duckdb/luajit-libs/usqlbridge-<os>-<arch>.<ext>` → 从 v0.2.0 release 拉一次。
 下载必须同时过「大小下限 + 平台头魔数」（ELF / PE / Mach-O）才算成功——release
 CDN 会静默截断（实测 11.2MB 的工件 6m25s 只落地 7.6MB，重试 0 字节，而同一时间
 raw 侧 1s 返回）。
@@ -107,14 +138,14 @@ raw 侧 1s 返回）。
 release CDN 慢或不通时，把下载基址指到任意镜像前缀（结尾必须带 `/`）：
 
 ```bash
-export USQL_BRIDGE_BASE_URL='https://gh-proxy.com/https://github.com/alitrack/usql-bridge/releases/download/v0.1.1/'
+export USQL_BRIDGE_BASE_URL='https://gh-proxy.com/https://github.com/alitrack/usql-bridge/releases/download/v0.2.0/'
 ```
 
 或者自己下 + 对官方校验和：
 
 ```bash
-gh release download v0.1.1 --repo alitrack/usql-bridge
-sha256sum -c SHA256SUMS            # 11.2MB 工件按此校验通过
+gh release download v0.2.0 --repo alitrack/usql-bridge
+sha256sum -c SHA256SUMS            # 20.8MB 工件按此校验通过
 cp usqlbridge-linux-amd64.so ~/.duckdb/luajit-libs/
 ```
 
@@ -128,6 +159,10 @@ cp usqlbridge-linux-amd64.so ~/.duckdb/luajit-libs/
 | CREATE / INSERT / SELECT / 聚合 / 写读回 / close | 全对 |
 | 单次 query（含 FFI 跨语言 + JSON 编码） | 0.1–0.3ms |
 | 200 次持续 query | ~0.2ms/次，无冷启、无退化 |
+| 10 万行 × 10 种声明类型——`op=query`（JSON） | 0.70–0.76s，19.2MB JSON 文本跨 FFI |
+| 10 万行 × 10 种声明类型——`op=export`（Parquet） | **0.38–0.40s**，文件 2.35MB（不压缩 6.8MB） |
+| `read_parquet` 读该文件 + `count/sum` | 0.002s |
+| 保真对比 JSON 路径 | `DATE`=2026-09-11、`TIMESTAMP` 无时区、`BOOLEAN`、`BIGINT` 9007199254740993 精确、`BLOB` `00FF000A0D010203` 字节精确、10 万行竖线一个不少 |
 
 ## 踩过的坑
 
@@ -142,11 +177,17 @@ cp usqlbridge-linux-amd64.so ~/.duckdb/luajit-libs/
 7. **GitHub release 的 CDN ≠ raw 的 CDN**，两者会独立抽风：release 拉 15MB 卡住时
    raw 可能秒回。所以自动下载是 best-effort，失败给出「手动放到哪」的 ERR 提示。
 8. **`/mnt/d` 是慢的 9p 盘**：`GOMODCACHE`/`GOPATH` 放 WSL 本地盘。
+9. **parquet-go 的 `date` 节点吃 int32 天数**，不是 `time.Time`（会把 Unix **秒**当天数写进去）：
+   DATE 列读回来是 `5461899-03-14 (BC)`，改成桥侧自己换算天数才对。
+10. **`luajit_table` 给模块传字符串，`luajit_vs` 传的是表**（每个参数一张表、按 chunk 批，
+    要还一张表）。同一个库文件必须两种形态都接：只当字符串处理时，`usql('<spec>')` 宏一调
+    就报 `attempt to call method 'match'`。
 
 ## 状态
 
-v0.1.1 —— 五个平台工件全部由 CI 原生构建 + 冒烟通过。目前只有 SQLite
-（`moderncsqlite`）驱动跑通了端到端；其他 scheme 只差一行 import，但尚未对真库验证。
+v0.2.0 —— 原生 Parquet 导出（`op=export`）+ v0.1.1 基线：五个平台工件全部由 CI 原生构建
++ 冒烟通过。目前只有 SQLite（`moderncsqlite`）驱动跑通了端到端；其他 scheme 只差一行
+import，但尚未对真库验证。
 
 ## 协议
 

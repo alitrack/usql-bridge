@@ -15,6 +15,7 @@ End-to-end through DuckDB (needs the duckdb-luajit extension, unsigned):
 
 ```bash
 duckdb -unsigned -batch < test_usql_bridge.sql
+duckdb -unsigned -batch < test_export.sql     # native Parquet export
 ```
 
 Toolchain: Go >= 1.26.1 (usql's go.mod floor; a newer host Go pulls it via
@@ -33,6 +34,12 @@ cross-compiled from Linux.
   (Ping at connect, so cold start lands there), `usql_query(id, sql)` and
   `usql_exec(id, sql)` returning JSON / `OK rows=N`, and `usql_close(id)`.
   Open `*sql.DB` handles live in `map[int]*sql.DB` guarded by a mutex.
+- `export.go` — `usql_export(spec)` (spec is the whole flat JSON, `id`/`sql`/
+  `path`/`format`/`compression`) writes the result set as Parquet from the
+  driver's declared column types and returns the file path. Auto-named files
+  (no `path` given) are registered per connection and removed in `usql_close`.
+  This is the *columnar* channel; the JSON ops are a display channel that loses
+  type information and mangles non-UTF-8 bytes.
 - Dependency direction: DuckDB `luajit` extension -> `usql.lua` (LuaJIT FFI,
   `ffi.cdef` + `ffi.load`) -> this c-shared library -> usql drivers ->
   `database/sql`. Nothing in the chain knows about the layers above it.
@@ -56,11 +63,22 @@ cross-compiled from Linux.
   that pattern — rename in all three places or none.
 - `-ldflags "-s -w"` is deliberate: it trims ~30% off the download while the
   exported symbols (which `ffi.load` needs) stay in `.dynsym`.
+- Declared type -> Parquet node is a fixed table in `mapColumn`; anything
+  unknown falls back to `VARCHAR` on purpose. Do not "improve" that fallback by
+  guessing numbers — a wrong guess is silent wrong data.
+- Parquet values are built with `parquet.SchemaOf` over a `reflect.StructOf`
+  row type (ordered fields; `parquet.Group` is a map and would sort columns
+  alphabetically). `*time.Time` + the `date` tag is a trap: parquet-go writes
+  Unix *seconds* into a day counter, so DATE goes through `*int32` epoch days.
+- A library file is entered two ways: `luajit_table(...)` passes the spec as a
+  **string**, `luajit_vs(...)`/the generated `usql(...)` macro passes a
+  **table** of that argument's chunk values and expects a table back. Both
+  shapes must be handled in the same entry function.
 
 ## Risk Gates
 
-- AUTO-APPROVED: editing `main.go`, `usql.lua`, `scripts/smoke_test.py`,
-  `test_usql_bridge.sql`, docs.
+- AUTO-APPROVED: editing `main.go`, `export.go`, `usql.lua`,
+  `scripts/smoke_test.py`, `test_usql_bridge.sql`, `test_export.sql`, docs.
 - REQUIRES APPROVAL: changing `build-release.sh` targets or Artifact names,
   bumping the pinned usql version in `go.mod`, editing `.github/workflows/`.
 - BOUNDARY (never touch without being asked): publishing a release or moving a
