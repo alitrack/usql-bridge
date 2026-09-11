@@ -1,44 +1,71 @@
 #!/usr/bin/env bash
-# Cross-compile the usql-bridge c-shared lib for the platforms the DuckDB
-# luajit extension ships. Output: dist/usqlbridge-<os>-<arch>.{so,dll,dylib}
+# Build the usql-bridge c-shared library for every platform the DuckDB luajit
+# extension ships.
 #
-# Requirements: Go >= 1.26 (usql's go.mod floor). CGO for the C host ABI.
-# Set USQL_VERSION to pin the upstream xo/usql version (default: latest v0.21.x).
+# IMPORTANT — cgo is mandatory:
+#   main.go has `import "C"` and uses //export, so -buildmode=c-shared needs
+#   CGO_ENABLED=1 *and* a C toolchain for the TARGET platform. Building with
+#   CGO_ENABLED=0 fails with "build constraints exclude all Go files".
+#   darwin targets therefore need a macOS host (Mach-O linker + Apple SDK);
+#   there is no usable cross toolchain for darwin on Linux.
+#   That is what .github/workflows/release.yml does: one native runner per OS.
+#
+# Usage:
+#   ./build-release.sh                 # every target this host can build
+#   ./build-release.sh linux-amd64 ...  # only the named targets
 set -euo pipefail
 cd "$(dirname "$0")"
-
-USQL_VERSION="${USQL_VERSION:-v0.21.4}"
-export GOTOOLCHAIN=go1.26.1+auto
 mkdir -p dist
 
-# Make go.mod point at the published version (strip any local replace).
-if grep -q '=> /' go.mod 2>/dev/null; then
-  echo "go.mod has a local replace; run from a clean checkout to release." >&2
-  exit 1
-fi
-
-build_one() {
-  local goos="$1" goarch="$2" cgo="$3" ext="$4"
-  echo "==> building ${goos}/${goarch}"
-  GOOS="$goos" GOARCH="$goarch" CGO_ENABLED="$cgo" \
-    go build -buildmode=c-shared -o "dist/usqlbridge-${goos}-${goarch}.${ext}" .
+# target -> "goos goarch ext cc" (empty cc = go default)
+target_spec() {
+  case "$1" in
+    linux-amd64)   echo "linux amd64 so gcc" ;;
+    linux-arm64)   echo "linux arm64 so aarch64-linux-gnu-gcc" ;;
+    darwin-arm64)  echo "darwin arm64 dylib cc" ;;
+    darwin-amd64)  echo "darwin amd64 dylib cc" ;;
+    windows-amd64) echo "windows amd64 dll x86_64-w64-mingw32-gcc" ;;
+    *) return 1 ;;
+  esac
 }
 
-# Linux: amd64 + arm64. moderncsqlite is pure Go so CGO_ENABLED=0 works and
-# keeps the artifact portable (no glibc version pin beyond what Go needs).
-build_one linux amd64 0 so
-build_one linux arm64 0 so
+ALL_TARGETS="linux-amd64 linux-arm64 darwin-arm64 darwin-amd64 windows-amd64"
 
-# macOS: arm64 (+ amd64 if a cross cgo toolchain is present; arm64 native is the default target)
-if [[ "$HOST_OS" == "darwin" || "$(uname -s)" == "Darwin" ]]; then
-  build_one darwin arm64 0 dylib
-  build_one darwin amd64 0 dylib || echo "skip darwin/amd64 (no cross cgo)"
+build_one() {
+  local t="$1" spec goos goarch ext cc
+  spec="$(target_spec "$t")" || { echo "!!! unknown target: $t" >&2; return 1; }
+  set -- $spec
+  goos="$1"; goarch="$2"; ext="$3"; cc="${4:-}"
+
+  if [[ -n "$cc" ]] && ! command -v "${cc%% *}" >/dev/null 2>&1; then
+    echo "!!! SKIP $t: C toolchain '$cc' not found on this host" >&2
+    return 1
+  fi
+
+  local out="dist/usqlbridge-${goos}-${goarch}.${ext}"
+  echo "==> ${goos}/${goarch}  CC=${cc:-<go default>}"
+  # Darwin/amd64 is built from an arm64 macOS runner by pointing clang at the
+  # x86_64 slice of the SDK (both arches ship in one SDK; no extra toolchain).
+  local extra=()
+  if [[ "$goos/$goarch" == "darwin/amd64" && "$(uname -s)" == "Darwin" ]]; then
+    extra=(CGO_CFLAGS="${CGO_CFLAGS:--arch x86_64}" CGO_LDFLAGS="${CGO_LDFLAGS:--arch x86_64}")
+  fi
+  # -s -w strips DWARF/symtab (~30% smaller download); exported C symbols live
+  # in .dynsym and survive, so the FFI bridge keeps working.
+  env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=1 ${cc:+CC="$cc"} "${extra[@]}" \
+    go build -trimpath -ldflags "-s -w" -buildmode=c-shared -o "$out" .
+  rm -f "dist/usqlbridge-${goos}-${goarch}.h"   # generated cgo header, not shipped
+  ls -l "$out"
+}
+
+rc=0
+if [[ $# -gt 0 ]]; then
+  for t in "$@"; do build_one "$t" || rc=1; done
+else
+  for t in $ALL_TARGETS; do build_one "$t" || true; done
 fi
 
-# Windows: needs mingw cross-compiler for c-shared. Best done on a Windows host.
-if [[ "${BUILD_WINDOWS:-0}" == "1" ]]; then
-  build_one windows amd64 1 dll
-fi
-
-ls -la dist/
+echo "=== dist/ ==="
+ls -l dist/ 2>/dev/null || true
+[[ $rc -eq 0 ]] || { echo "one or more requested targets could not be built" >&2; exit $rc; }
 echo "done"

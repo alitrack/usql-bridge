@@ -1,41 +1,155 @@
-# usql-bridge PoC
+# usql-bridge
 
-验证「Go c-shared 内嵌 usql 核心 → 常驻 database/sql 连接 → LuaJIT FFI 桥 → DuckDB UDF」这条 in-process 路线。
-定位：补「不要用户装 usql 二进制、又要 DuckDB 进程内常驻连接」的中间缝（长尾库低 QPS 分析，主流走 duckdb_universal Rust 原生）。
+In-process **Go c-shared** bridge that embeds [xo/usql](https://github.com/xo/usql)'s
+`database/sql` drivers behind a LuaJIT FFI table function, so DuckDB (via the
+[duckdb-luajit](https://github.com/alitrack/duckdb-luajit) extension) can query
+long-tail databases **with a resident connection and no per-query process start**.
 
-## 文件
-- `main.go` — Go 桥，`//export usql_connect/usql_query/usql_exec/usql_close`
-  - 连接按 int id 常驻复用（`map[int]*sql.DB`），**多次 query 无冷启**
-  - `usql_connect` 内 `Ping()` 把冷启动前置到 connect，首个 query 不背冷启
-  - import `_ github.com/xo/usql/drivers/moderncsqlite`（纯 Go SQLite，免 CGO）
-  - 结果 JSON 编码返回（`[]map[string]any`，列名做 key，`[]byte`→string、`time.Time`→RFC3339 归一化）
-- `usql.lua` — LuaJIT FFI 桥：`ffi.cdef` 声明 + `ffi.load`，返回串必须 `ffi.C.free`（cdef 要先声明 `extern void free(void*)`）
-- `test_usql_bridge.sql` — quick_compile + 全链路冒烟 + 基准
-- `build.sh` — `go mod tidy` + `go build -buildmode=c-shared`（GOTOOLCHAIN=go1.26.1，usql go.mod 要 1.26）
-- `usql-src/` — 本地 usql 源码（curl codeload tarball 拉的，git clone 走 GnuTLS 挂）
+Chinese version: [README_cn.md](README_cn.md)
 
-## 架构关键点
-- **usql 每个驱动都是标准 `database/sql` driver**，`drivers.Open(ctx, *dburl.URL, nil, nil)` 直接返回可常驻的 `*sql.DB`。这是整条路线成立的地基——桥不用碰 usql 的 CLI/REPL 内部机制，纯走 `database/sql`。
-- 驱动 `init()` 时自注册，桥里 import 一个即得一个；要支持哪个库就 import 对应 `drivers/<scheme>`。
-- **scheme 不是路径猜的**：`moderncsqlite`（纯 Go）vs `sqlite3`（mattn/CGO）是不同 scheme，连接串前缀必须对。
+## Why
 
-## 实测（go1.25.8/1.26 toolchain, duckdb 1.5.5, luajit ELF, SQLite via moderncsqlite）
-| 项 | 结果 |
+The existing `dbcli` route shells out to a `usql` binary for every query:
+30–100 ms of process cold start each time. This bridge keeps the connection
+inside the DuckDB process and hands the same connection back for every query:
+
+| Route | Cost per query | Needs |
+|---|---|---|
+| `dbcli` + `usql` binary | 30–100 ms (process spawn) | `usql` installed on the host |
+| **usql-bridge** (this repo) | **~0.1–0.2 ms sustained** | one c-shared artifact, no external binary |
+
+The mechanism is one line of design: **every usql driver *is* a standard
+`database/sql` driver**, and `drivers.Open(ctx, *dburl.URL, nil, nil)` returns a
+`*sql.DB` that stays open. The bridge never touches usql's CLI/REPL internals.
+
+Scope note: for mainstream analytical sources, `duckdb_universal` (native Rust
+connectors) remains the better answer. This bridge fills the middle gap — a
+long tail of rarely-queried databases where a global binary isn't installed but
+an in-process connection is worth having.
+
+## Artifacts
+
+| Platform | File |
 |---|---|
-| connect + Ping | `id=1`，冷启前置到这里 |
-| CREATE/INSERT/SELECT/聚合/写读回/close | 全对 ✅ |
-| 单次 query 延迟 | **0.1~0.3ms**（含 FFI 跨语言 + JSON 编码） |
-| **200 次持续 query** | **17~21ms = ~0.1ms/次**，无冷启、无退化 ✅（核心卖点） |
+| Linux x86_64 | `usqlbridge-linux-amd64.so` |
+| Linux arm64 | `usqlbridge-linux-arm64.so` |
+| macOS Apple Silicon | `usqlbridge-darwin-arm64.dylib` |
+| macOS Intel | `usqlbridge-darwin-amd64.dylib` |
+| Windows x86_64 | `usqlbridge-windows-amd64.dll` |
 
-## 踩的坑
-1. **Go 返回 `C.CString`，Lua 侧必须 `ffi.C.free`，且 `free` 要在 cdef 显式声明**（否则 `missing declaration for symbol 'free'`）。
-2. **`ffi.cdef` 的返回类型要和 Go `//export` 签名严格一致**：connect 从 `C.int` 改成 `*C.char`（带错误信息）后，Lua cdef 没跟着改 → `bad argument #1 to 'string' (cannot convert 'number' to 'const char *')`。连接其实成功了，只是显示层错。
-3. **usql 的 sqlite scheme 是 `moderncsqlite` 不是 `sqlite3`**，用错连不上。
-4. **别拿 DuckDB `COPY ... (FORMAT CSV)` 出的文件当 SQLite 库**：扩展名 `.db` 骗人，内容是 CSV，SQLite 驱动按二进制格式打开直接失败。测试让 usql 自己 `CREATE TABLE` 建库，不依赖外部 fixture。
-5. **构建环境**：`/mnt/d` 是 9p 慢盘，GOMODCACHE/GOPATH 放 WSL 本地盘（`/home/lhy/`）；usql go.mod 要 go≥1.26.1，本机 1.25.8 需 `GOTOOLCHAIN=go1.26.1+auto` 拉工具链。`wsl bash -lc` 从 Windows bash 起后台不可靠，长构建用前台 + 高 timeout。
+## Files
 
-## 结论
-in-process 路线 **FEASIBLE**，形态确认 = **labs 一个 `usql.lua` + 一个 Go c-shared 桥（按平台出 .so/.dll/.dylib）**，不新建扩展。
-- 单查询 ~0.1ms 已比「每查询拉 usql 二进制」进程冷启（30-100ms）快 2-3 个数量级，且连接常驻。
-- 代价：Go 桥要按平台出二进制工件（.so/.dll/.dylib × amd64/arm64），这是唯一真实成本；labs 目前是纯 .lua 拉取，二进制是新类别（建议 GitHub release assets 按 tag 拉）。
-- 触发升级成真·扩展的条件：需要 typed 结果集（binary 类型解码）/ 连接级 AST 写保护 / QPS 高到 0.1ms 的 FFI+JSON 开销都嫌慢。
+| File | Purpose |
+|---|---|
+| `main.go` | the bridge: `//export usql_connect / usql_query / usql_exec / usql_close` |
+| `usql.lua` | LuaJIT FFI wrapper — `ffi.cdef` + `ffi.load`, returns JSON strings |
+| `build-release.sh` | builds c-shared artifacts per target (`linux-amd64`, `linux-arm64`, `darwin-arm64`, `darwin-amd64`, `windows-amd64`) |
+| `scripts/smoke_test.py` | loads a built artifact with ctypes and runs a SQL round trip — the per-platform CI gate |
+| `test_usql_bridge.sql` | full chain through DuckDB → luajit → bridge → SQLite, plus a 200-query benchmark |
+| `.github/workflows/` | `ci.yml` (build + smoke test on every push) and `release.yml` (tag → all-platform release) |
+| `usqlbridge.h` | generated cgo header, kept in-tree for reference |
+
+## Usage
+
+```sql
+LOAD 'luajit.duckdb_extension';
+
+SELECT * FROM luajit_module(mode := 'quick_compile', sql_name := 'usql',
+  source := 'return dofile(''usql.lua'')');
+
+-- connect (cold start happens here: the bridge Pings immediately)
+SELECT luajit_s('usql', {op: 'connect', url: 'moderncsqlite:///tmp/app.db'});
+
+-- query: one JSON object per row
+SELECT luajit_s('usql', {op: 'query', id: 1, sql: 'SELECT id, name FROM src ORDER BY id'});
+
+-- write
+SELECT luajit_s('usql', {op: 'exec', id: 1, sql: 'INSERT INTO src VALUES (9, ''zeta'')'});
+
+-- sustained-query benchmark
+SELECT luajit_s('usql', {op: 'benchmark', id: 1, n: 200, sql: 'SELECT 1'});
+
+SELECT luajit_s('usql', {op: 'close', id: 1});
+```
+
+Connection ids stay valid for the lifetime of the DuckDB process (Go side keeps
+`map[int]*sql.DB`). Errors come back as a single `ERR: <reason>` row.
+
+## Drivers (schemes)
+
+The release embeds **`moderncsqlite`** — pure-Go SQLite, **no CGO at runtime**.
+The scheme is `moderncsqlite`, *not* `sqlite3`: those are different usql drivers
+and the wrong one simply fails to connect.
+
+Every usql driver registers itself in `init()`, so adding a backend is one
+import plus a rebuild:
+
+```go
+_ "github.com/xo/usql/drivers/postgres"   // then: postgres://user@host/db
+```
+
+DSN syntax follows `github.com/xo/dburl` — the same URLs the `usql` CLI takes.
+
+## Build from source
+
+```bash
+./build-release.sh                  # every target this host can build (others are skipped)
+./build-release.sh linux-amd64      # one target
+python3 scripts/smoke_test.py dist/usqlbridge-linux-amd64.so
+```
+
+Requirements: Go ≥ 1.26.1 (usql's floor), cgo enabled, and a C toolchain for
+the target (`gcc`, `gcc-aarch64-linux-gnu`, `x86_64-w64-mingw32-gcc`, or clang
+on macOS).
+
+**cgo is mandatory.** `main.go` has `import "C"` and uses `//export`, so
+`-buildmode=c-shared` needs `CGO_ENABLED=1`; with `CGO_ENABLED=0` the go tool
+reports *"build constraints exclude all Go files"*. Because darwin needs a
+Mach-O linker and the Apple SDK, macOS artifacts are built on a macOS runner —
+there is no usable darwin cross-toolchain on Linux. That is why releases come
+from a native runner matrix (`.github/workflows/release.yml`) instead of one
+machine cross-compiling everything.
+
+## Measured
+
+Environment: go1.26.1, DuckDB 1.5.5, luajit ELF extension, SQLite via
+`moderncsqlite`.
+
+| Item | Result |
+|---|---|
+| connect + Ping | `id=1`, cold start absorbed at connect |
+| CREATE / INSERT / SELECT / aggregate / write-read-back / close | all correct |
+| single query (incl. FFI hop + JSON encoding) | 0.1–0.3 ms |
+| 200 sustained queries | ~0.2 ms each, no cold start, no degradation |
+
+## Pitfalls hit while building this
+
+1. **`C.CString` must be freed Lua-side** — and `free` has to be declared in
+   `ffi.cdef` (`missing declaration for symbol 'free'` otherwise).
+2. **`ffi.cdef` must match the `//export` signature exactly.** Changing
+   `usql_connect` from `C.int` to `*C.char` (to carry errors) without updating
+   the cdef produced `cannot convert 'number' to 'const char *'` — the connect
+   had actually succeeded; only the presentation layer was wrong.
+3. **`local ok = pcall(ffi.load, p)` only captures a boolean** — the library
+   object is the *second* return value.
+4. **Lua closures only see `local`s declared before them**; a later `local`
+   reads as a global and evaluates to `nil` at call time.
+5. **usql's SQLite scheme is `moderncsqlite`**, not `sqlite3`.
+6. **A DuckDB `COPY ... (FORMAT CSV)` file is not a SQLite database** even when
+   named `.db`; let the driver `CREATE TABLE` its own fixture instead.
+7. **GitHub *release* download CDN is not the raw CDN.** They fail
+   independently — a `.so` pulled from a release can stall where
+   `raw.githubusercontent.com` is instant, so downloads stay best-effort and
+   the library prints an actionable error telling you where to drop the file.
+8. **`/mnt/d` is a slow 9p mount** — keep `GOMODCACHE`/`GOPATH` on the native
+   filesystem.
+
+## Status
+
+v0.1.1 — all five platform artifacts built and smoke-tested in CI. Only the
+SQLite (`moderncsqlite`) driver has been exercised end-to-end so far; the other
+schemes are one import away but not yet verified against live servers.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

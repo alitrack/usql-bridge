@@ -1,0 +1,100 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: linux-amd64 }
+          - { os: ubuntu-latest, target: linux-arm64 }
+          - { os: macos-14, target: darwin-arm64 }
+          - { os: macos-14, target: darwin-amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install aarch64 cross toolchain
+        if: matrix.target == 'linux-arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Verify go.mod is release-clean (no local replace)
+        run: |
+          if grep -q '=> /' go.mod; then
+            echo "go.mod contains a local replace directive; refusing to build" >&2
+            exit 1
+          fi
+
+      - name: Build c-shared library
+        run: ./build-release.sh ${{ matrix.target }}
+
+      - name: Smoke test the artifact (ctypes, same C ABI LuaJIT FFI uses)
+        run: python3 scripts/smoke_test.py dist/usqlbridge-*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usqlbridge-${{ matrix.target }}
+          path: dist/usqlbridge-*
+          if-no-files-found: error
+
+  build-windows:
+    name: build windows-amd64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # Go's cgo needs a mingw-w64 gcc for windows/amd64.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build c-shared library
+        shell: msys2 {0}
+        env:
+          CC: x86_64-w64-mingw32-gcc
+        run: ./build-release.sh windows-amd64
+
+      - name: List artifact
+        shell: bash
+        run: ls -l dist/
+
+      - name: Smoke test the artifact (ctypes, same C ABI LuaJIT FFI uses)
+        run: python scripts/smoke_test.py dist/usqlbridge-windows-amd64.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usqlbridge-windows-amd64
+          path: dist/usqlbridge-windows-amd64.dll
+          if-no-files-found: error
