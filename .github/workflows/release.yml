@@ -11,15 +11,19 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.target }}
+    # One native runner per artifact: the c-shared library can only be
+    # smoke-tested on the architecture it was built for.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest, target: linux-amd64 }
-          - { os: ubuntu-latest, target: linux-arm64 }
+          - { os: ubuntu-24.04-arm, target: linux-arm64, cc: gcc }
           - { os: macos-14, target: darwin-arm64 }
           - { os: macos-14, target: darwin-amd64 }
+    env:
+      CC: ${{ matrix.cc }}
     steps:
       - uses: actions/checkout@v4
 
@@ -32,12 +36,6 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install aarch64 cross toolchain
-        if: matrix.target == 'linux-arm64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
       - name: Verify go.mod is release-clean (no local replace)
         run: |
           if grep -q '=> /' go.mod; then
@@ -49,7 +47,26 @@ jobs:
         run: ./build-release.sh ${{ matrix.target }}
 
       - name: Smoke test the artifact (ctypes, same C ABI LuaJIT FFI uses)
+        if: matrix.target != 'darwin-amd64'
         run: python3 scripts/smoke_test.py dist/usqlbridge-*
+
+      # The x86_64 dylib cannot be loaded by an arm64 Python; try Rosetta and
+      # fall back to a static check that says so out loud.
+      - name: Smoke test darwin/amd64 (Rosetta, else static check)
+        if: matrix.target == 'darwin-amd64'
+        run: |
+          set -euo pipefail
+          art=dist/usqlbridge-darwin-amd64.dylib
+          if arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            echo "running the x86_64 artifact under Rosetta"
+            arch -x86_64 python3 scripts/smoke_test.py "$art"
+          else
+            echo "::warning::Rosetta unavailable - falling back to a static check for darwin/amd64"
+            lipo -archs "$art"
+            nm -gU "$art" | grep -q _usql_connect
+            lipo -archs "$art" | grep -q x86_64
+            echo "static check OK: x86_64 Mach-O exporting usql_connect"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -72,10 +89,14 @@ jobs:
         with:
           python-version: '3.x'
 
+      # Go's cgo needs a mingw-w64 gcc for windows/amd64.
+      # path-type: inherit keeps the Windows PATH (and therefore go.exe)
+      # visible inside the msys2 shell - the strict default drops it.
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: false
+          path-type: inherit
           install: mingw-w64-x86_64-gcc
 
       - name: Build c-shared library
@@ -105,6 +126,7 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # A release with a missing platform is a silent lie; refuse to publish.
       - name: Verify every platform artifact is present
         run: |
           set -euo pipefail

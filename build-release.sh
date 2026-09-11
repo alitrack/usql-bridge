@@ -36,6 +36,7 @@ build_one() {
   spec="$(target_spec "$t")" || { echo "!!! unknown target: $t" >&2; return 1; }
   set -- $spec
   goos="$1"; goarch="$2"; ext="$3"; cc="${4:-}"
+  cc="${CC:-$cc}"   # an explicit CC from the environment wins over the default
 
   if [[ -n "$cc" ]] && ! command -v "${cc%% *}" >/dev/null 2>&1; then
     echo "!!! SKIP $t: C toolchain '$cc' not found on this host" >&2
@@ -52,7 +53,9 @@ build_one() {
   fi
   # -s -w strips DWARF/symtab (~30% smaller download); exported C symbols live
   # in .dynsym and survive, so the FFI bridge keeps working.
-  env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=1 ${cc:+CC="$cc"} "${extra[@]}" \
+  # ${extra[@]+"${extra[@]}"} — empty-array expansion that also works on the
+  # bash 3.2 shipped with macOS, where a bare "${extra[@]}" trips `set -u`.
+  env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=1 ${cc:+CC="$cc"} ${extra[@]+"${extra[@]}"} \
     go build -trimpath -ldflags "-s -w" -buildmode=c-shared -o "$out" .
   rm -f "dist/usqlbridge-${goos}-${goarch}.h"   # generated cgo header, not shipped
   ls -l "$out"
