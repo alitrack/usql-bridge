@@ -1,0 +1,9 @@
+dist/
+*.so
+*.dll
+*.dylib
+usql-src/
+test.db
+build.log
+go.mod.local-bak
+go.sum.local-bak
