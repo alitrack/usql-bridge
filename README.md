@@ -106,6 +106,30 @@ there is no usable darwin cross-toolchain on Linux. That is why releases come
 from a native runner matrix (`.github/workflows/release.yml`) instead of one
 machine cross-compiling everything.
 
+## Getting the artifact (and verifying it)
+
+`usql.lua` resolves the library as: `spec.lib` → `USQL_BRIDGE_LIB` →
+`~/.duckdb/luajit-libs/usqlbridge-<os>-<arch>.<ext>` → one download attempt from
+the v0.1.1 release. A download is accepted only if it clears a size floor **and**
+carries the platform's magic bytes (ELF / PE / Mach-O): the release CDN does
+truncate silently (measured: 7.6 MB of an 11.2 MB artifact after 6m25s, then
+0 bytes on retry, while `raw.githubusercontent.com` answered in 1s).
+
+Where the release CDN is slow or blocked, point the download at any mirror
+prefix (trailing slash required) and let the library fetch it:
+
+```bash
+export USQL_BRIDGE_BASE_URL='https://gh-proxy.com/https://github.com/alitrack/usql-bridge/releases/download/v0.1.1/'
+```
+
+Or fetch it yourself and check the published checksums:
+
+```bash
+gh release download v0.1.1 --repo alitrack/usql-bridge
+sha256sum -c SHA256SUMS            # 11.2 MB artifact verified this way
+cp usqlbridge-linux-amd64.so ~/.duckdb/luajit-libs/
+```
+
 ## Measured
 
 Environment: go1.26.1, DuckDB 1.5.5, luajit ELF extension, SQLite via

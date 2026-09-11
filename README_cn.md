@@ -96,6 +96,28 @@ Apple SDK，Linux 上不存在可用的 darwin 交叉工具链——所以 relea
 **各 OS 原生 runner 矩阵**（`.github/workflows/release.yml`），不是一台机器
 交叉编译所有平台。
 
+## 取工件与校验
+
+`usql.lua` 的解析顺序：`spec.lib` → `USQL_BRIDGE_LIB` →
+`~/.duckdb/luajit-libs/usqlbridge-<os>-<arch>.<ext>` → 从 v0.1.1 release 拉一次。
+下载必须同时过「大小下限 + 平台头魔数」（ELF / PE / Mach-O）才算成功——release
+CDN 会静默截断（实测 11.2MB 的工件 6m25s 只落地 7.6MB，重试 0 字节，而同一时间
+raw 侧 1s 返回）。
+
+release CDN 慢或不通时，把下载基址指到任意镜像前缀（结尾必须带 `/`）：
+
+```bash
+export USQL_BRIDGE_BASE_URL='https://gh-proxy.com/https://github.com/alitrack/usql-bridge/releases/download/v0.1.1/'
+```
+
+或者自己下 + 对官方校验和：
+
+```bash
+gh release download v0.1.1 --repo alitrack/usql-bridge
+sha256sum -c SHA256SUMS            # 11.2MB 工件按此校验通过
+cp usqlbridge-linux-amd64.so ~/.duckdb/luajit-libs/
+```
+
 ## 实测
 
 环境：go1.26.1、DuckDB 1.5.5、luajit ELF 扩展、SQLite（`moderncsqlite`）。
